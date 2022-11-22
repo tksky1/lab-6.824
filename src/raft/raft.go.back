@@ -66,11 +66,14 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 
-	State          int       //状态，0 follower 1: candidate 2: leader
-	nextActiveTime time.Time //下次造反时间
+	State         int //状态，0 follower 1: candidate 2: leader
+	lastHeartBeat time.Time
+	hasKilled     bool
+	muSend        sync.Mutex //用于发rpc时避免race
+	channal       chan int
 
 	//candidate使用
-	//votesGot int
+	votesGot int
 
 	//leader使用
 	nextIndex  []int
@@ -185,50 +188,64 @@ type AppendEntriesReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	//注意这个是handler
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
+	//rf.mu.Lock()
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm || rf.votedFor != -1 || rf.State != 0 {
+		println("refuse vote,votefor==", rf.votedFor, "state==", rf.State)
 		reply.VoteGranted = false
 	} else {
 		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
+		lenLog := len(rf.Log)
+		if lenLog > 0 && args.Term == rf.currentTerm && args.LastLogIndex < rf.Log[lenLog-1].Index {
+			reply.VoteGranted = false
+		}
 	}
 	println(rf.me, "号收到了投票请求，返回结果是", reply.VoteGranted)
 
+	//rf.mu.Unlock()
 }
 
 func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArg, reply *AppendEntriesReply) {
 	//注意这个是handler
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	reply.Term = rf.currentTerm
 	success := true
 
-	// 收到来自有效leader的心跳
-	if args.Term >= rf.currentTerm {
-		rf.votedFor = -1
-		//rf.lastHeartBeat = time.Now()
-		randomTerm := 150 + rand.Intn(500)
-		rf.nextActiveTime = time.Now().Add(time.Duration(randomTerm) * time.Millisecond)
-		println(rf.me, "收到来自leader的有效心跳")
-		if rf.State != 0 {
-			rf.State = 0
-			rf.currentTerm = args.Term
-		}
+	rf.votedFor = -1
+	rf.lastHeartBeat = time.Now()
+	if rf.State != 0 && args.Term > rf.currentTerm {
+		rf.State = 0
+		rf.votesGot = 1
+		println("收到heartbeat,", rf.me, "号转为follower")
+		rf.currentTerm = args.Term
 	}
-
 	if args.Term < rf.currentTerm {
 		success = false
 	} else {
 		rf.currentTerm = args.Term
 	}
-
+	if len(rf.Log) > 0 {
+		if len(rf.Log) > args.PrevLogIndex && rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			//success = false
+			rf.Log = rf.Log[0:args.PrevLogIndex]
+		}
+		if rf.Log[len(rf.Log)-1].Index < args.Entries[0].Index {
+			rf.Log = append(rf.Log, args.Entries...)
+		}
+	} else {
+		rf.Log = append(rf.Log, args.Entries...)
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit > (len(rf.Log) - 1) {
+			rf.commitIndex = len(rf.Log) - 1
+		} else {
+			rf.commitIndex = args.LeaderCommit
+		}
+	}
 	reply.Success = success
-	//println(rf.me, "号收到心跳，来自：", args.LeaderId, "success=", success)
+	println(rf.me, "号收到心跳，来自：", args.LeaderId, "success=", success)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -259,16 +276,14 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArg, reply *AppendEntrie
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	//rf.mu.Lock()
-	//defer rf.mu.Unlock()
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArg, reply *AppendEntriesReply) {
-
-	rf.peers[server].Call("Raft.AppendEntriesHandler", args, reply)
-
+func (rf *Raft) sendAppendEntries(server *labrpc.ClientEnd, args *AppendEntriesArg, reply *AppendEntriesReply) {
+	rf.muSend.Lock()
+	server.Call("Raft.AppendEntriesHandler", args, reply)
+	rf.muSend.Unlock()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -305,6 +320,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.hasKilled = true
 }
 
 func (rf *Raft) killed() bool {
@@ -312,106 +328,92 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) executeElection(arg RequestVoteArgs) {
-	maxTermGot := 0
-	voteGrantGot := 0
-	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			println(rf.me, "向", i, "发送了投票请求")
-			reply := RequestVoteReply{}
-			rf.sendRequestVote(i, &arg, &reply)
-
-			println(rf.me, "在term", rf.currentTerm, "收到了", i, "的投票回信：", reply.VoteGranted)
-			if reply.VoteGranted {
-				voteGrantGot++
-			}
-			if reply.Term > maxTermGot {
-				maxTermGot = reply.Term
-			}
-		}
-	}
-
-	rf.mu.Lock()
-	if rf.State == 1 && voteGrantGot > len(rf.peers)/2 && rf.currentTerm >= maxTermGot {
-		println(rf.me, "成为了leader!")
-		rf.State = 2
-		go rf.doHeartBeat()
-	}
-
-	if rf.currentTerm < maxTermGot {
-		rf.currentTerm = maxTermGot
-		rf.State = 0
-	}
-	rf.mu.Unlock()
-}
-
 func (rf *Raft) launchElection() {
-
+	rf.muSend.Lock()
 	rf.currentTerm++
 	rf.votedFor = rf.me
-
+	rf.votesGot = 1
 	lenLog := len(rf.Log)
+
 	var arg RequestVoteArgs
 	if lenLog == 0 {
 		arg = RequestVoteArgs{rf.currentTerm, rf.me, 0, 0}
 	} else {
 		arg = RequestVoteArgs{rf.currentTerm, rf.me, rf.Log[lenLog-1].Index, rf.Log[lenLog-1].Term}
 	}
+	reply := RequestVoteReply{}
 
-	go rf.executeElection(arg)
-
+	rf.muSend.Unlock()
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go func(i int) {
+				println(rf.me, "向", i, "发送了投票请求")
+				rf.muSend.Lock()
+				rf.sendRequestVote(i, &arg, &reply)
+				if rf.State == 2 {
+					rf.muSend.Unlock()
+					return
+				}
+				if reply.VoteGranted {
+					rf.votesGot++
+					println(rf.me, "号收到一个投票")
+					if rf.votesGot > len(rf.peers)/2 {
+						rf.State = 2
+						println(rf.me, "号成为了leader！")
+						go rf.doHeartBeat()
+					}
+				}
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.State = 0
+					println(rf.me, "号发现了更大的term，转为follower")
+				}
+				rf.muSend.Unlock()
+			}(i)
+		}
+	}
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-
+	randomTerm := 150 + rand.Intn(500)
+	time.Sleep(time.Millisecond * time.Duration(randomTerm))
 	for rf.killed() == false {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		rf.mu.Lock()
-		if rf.State != 2 {
-			if time.Now().After(rf.nextActiveTime) {
+		if rf.State == 0 {
+			if (time.Now().Sub(rf.lastHeartBeat)).Milliseconds() > int64(randomTerm) {
 				// 随机周期内没有收到心跳，转变为candidate
-				randomTerm := 150 + rand.Intn(500)
-				rf.nextActiveTime = time.Now().Add(time.Duration(randomTerm) * time.Millisecond)
 				rf.State = 1
+				randomTerm = 150 + rand.Intn(500)
 				println(rf.me, "号没有收到心跳，发起了投票")
 				rf.launchElection()
 			}
+		} else if rf.State == 1 {
+			if (time.Now().Sub(rf.lastHeartBeat)).Milliseconds() > int64(randomTerm) {
+				rf.muSend.Lock()
+				if rf.votesGot > len(rf.peers)/2 {
+					rf.State = 2
+					println(rf.me, "号成为了leader！")
+					go rf.doHeartBeat()
+				} else {
+					rf.launchElection()
+					randomTerm = 150 + rand.Intn(500)
+					println(rf.me, "号发起的投票过期，重新发起")
+				}
+				rf.muSend.Unlock()
+			} else {
+				rf.votesGot = 1
+				rf.State = 0
+				println("收到heartbeat,", rf.me, "号转为follower")
+			}
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Millisecond * 10)
+		time.Sleep(time.Millisecond * time.Duration(randomTerm))
 	}
-}
-
-func (rf *Raft) executeHeartBeat(arg AppendEntriesArg) {
-	maxTerm := 0
-	allReplySuccess := true
-	println("leader", rf.me, "正在发心跳")
-	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			reply := AppendEntriesReply{}
-			rf.sendAppendEntries(i, &arg, &reply)
-			if reply.Term > maxTerm {
-				maxTerm = reply.Term
-			}
-			if !reply.Success {
-				allReplySuccess = false
-			}
-		}
-	}
-
-	if allReplySuccess {
-		return
-	}
-
-	rf.mu.Lock()
-	if rf.currentTerm < maxTerm {
-		rf.currentTerm = maxTerm
-	}
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) doHeartBeat() {
@@ -428,10 +430,18 @@ func (rf *Raft) doHeartBeat() {
 				rf.currentTerm, rf.me, rf.lastApplied,
 				rf.Log[rf.lastApplied].Term, nil, rf.commitIndex}
 		}
-
+		reply := AppendEntriesReply{}
+		peerAmount := len(rf.peers)
+		peers := rf.peers
 		rf.mu.Unlock()
-		go rf.executeHeartBeat(arg)
-
+		for i := 0; i < peerAmount; i++ {
+			if i != rf.me {
+				go func(entriesArg *AppendEntriesArg, entriesReply *AppendEntriesReply, server *labrpc.ClientEnd) {
+					rf.sendAppendEntries(server, entriesArg, entriesReply)
+				}(&arg, &reply, peers[i])
+			}
+		}
+		//println("leader", rf.me, "正在发心跳")
 		time.Sleep(time.Millisecond * 150)
 		rf.mu.Lock()
 	}
@@ -456,8 +466,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.votedFor = -1
-	randomTerm := 150 + rand.Intn(500)
-	rf.nextActiveTime = time.Now().Add(time.Duration(randomTerm) * time.Millisecond)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
