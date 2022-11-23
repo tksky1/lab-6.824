@@ -202,10 +202,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.State = 0
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		//println(rf.me, "在candidate时收到来自更高term的消息，转follower")
+		println(rf.me, "在candidate时收到来自更高term的消息，转follower")
 	}
 
-	//println(rf.me, "号收到了投票请求，返回结果是", reply.VoteGranted)
+	println(rf.me, "号收到了投票请求，返回结果是", reply.VoteGranted)
 
 }
 
@@ -220,9 +220,10 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArg, reply *AppendEntrie
 	// 收到来自有效leader的心跳
 	if args.Term >= rf.currentTerm {
 		rf.votedFor = -1
+		//rf.lastHeartBeat = time.Now()
 		randomTerm := 150 + rand.Intn(500)
 		rf.nextActiveTime = time.Now().Add(time.Duration(randomTerm) * time.Millisecond)
-		//println(rf.me, "收到来自leader的有效心跳")
+		println(rf.me, "收到来自leader的有效心跳")
 		if rf.State != 0 {
 			rf.State = 0
 			rf.currentTerm = args.Term
@@ -236,6 +237,7 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArg, reply *AppendEntrie
 	}
 
 	reply.Success = success
+	//println(rf.me, "号收到心跳，来自：", args.LeaderId, "success=", success)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -325,13 +327,13 @@ func (rf *Raft) executeElection(server int, term int, arg RequestVoteArgs) {
 	rf.sendRequestVote(server, &arg, &reply)
 
 	rf.mu.Lock()
-	//println(rf.me, "在term", rf.currentTerm, "收到了", server, "的投票回信：", reply.VoteGranted)
+	println(rf.me, "在term", rf.currentTerm, "收到了", server, "的投票回信：", reply.VoteGranted)
 
 	if rf.currentTerm < reply.Term {
 		rf.State = 0
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
-		//println(rf.me, "在candidate时收到来自更高term的消息，转follower")
+		println(rf.me, "在candidate时收到来自更高term的消息，转follower")
 	}
 
 	if reply.VoteGranted && rf.State == 1 {
@@ -398,7 +400,7 @@ func (rf *Raft) ticker() {
 func (rf *Raft) executeHeartBeat(arg AppendEntriesArg) {
 	maxTerm := 0
 	allReplySuccess := true
-	//println("leader", rf.me, "正在发心跳")
+	println("leader", rf.me, "正在发心跳")
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			reply := AppendEntriesReply{}
