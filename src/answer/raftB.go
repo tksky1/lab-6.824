@@ -558,9 +558,6 @@ func (rf *Raft) doHeartBeat() {
 		for i := 0; i < lenPeers; i++ {
 			if i != rf.me {
 				if rf.Log[len(rf.Log)-1].Index >= rf.nextIndex[i] { //按论文检测是否发entry
-					if rf.nextIndex[i] == 0 {
-						rf.nextIndex[i] = 1
-					}
 					args[i] = AppendEntriesArg{
 						Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: rf.nextIndex[i] - 1,
 						PrevLogTerm: rf.Log[rf.nextIndex[i]-1].Term, Entry: []LogEntry{rf.Log[rf.nextIndex[i]]},

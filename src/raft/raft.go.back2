@@ -66,17 +66,16 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 
-	State          int           //状态，0 follower 1: candidate 2: leader
-	nextActiveTime time.Time     //下次造反时间
-	applyChan      chan ApplyMsg //用于和tester交互applyMsg
+	State          int       //状态，0 follower 1: candidate 2: leader
+	nextActiveTime time.Time //下次造反时间
 
 	//candidate使用
 	votesGot int //收到的票数
 
 	//leader使用
-	nextIndex         []int
-	matchIndex        []int
-	serverAppendCount []int //用于计数已经append完成第i号log的follower的数量
+	nextIndex  []int
+	matchIndex []int
+	indexStat  []int //处于index的log被成功复制到的服务器数，用于判断commit
 }
 
 type LogEntry struct {
@@ -195,31 +194,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm || rf.votedFor != -1 || rf.State != 0 {
 		reply.VoteGranted = false
 	} else {
-		lenLog := len(rf.Log)
-
-		if lenLog > 0 && args.LastLogTerm < rf.Log[lenLog-1].Term {
-			reply.VoteGranted = false
-			return
-		}
-
-		if lenLog > 0 && args.LastLogTerm == rf.Log[lenLog-1].Term && args.LastLogIndex < lenLog-1 {
-			reply.VoteGranted = false
-			return
-		}
-
 		reply.VoteGranted = true
+		//println(rf.me, "同意了", args.CandidateId, "的投票请求")
 		rf.votedFor = args.CandidateId
 		randomTerm := 150 + rand.Intn(500)
 		rf.nextActiveTime = time.Now().Add(time.Duration(randomTerm) * time.Millisecond)
 	}
-	if args.Term > rf.currentTerm && rf.State == 1 {
+	if args.Term > rf.currentTerm {
 		rf.State = 0
 		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		//println(rf.me, "在candidate时收到来自更高term的消息，转follower")
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+		randomTerm := 150 + rand.Intn(500)
+		rf.nextActiveTime = time.Now().Add(time.Duration(randomTerm) * time.Millisecond)
+		//println(rf.me, "转follower并为", args.CandidateId, "投票")
 	}
-
-	//println(rf.me, "号收到了投票请求，返回结果是", reply.VoteGranted)
 
 }
 
@@ -234,9 +223,9 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArg, reply *AppendEntrie
 	// 收到来自有效leader的心跳
 	if args.Term >= rf.currentTerm {
 		rf.votedFor = -1
+		//rf.lastHeartBeat = time.Now()
 		randomTerm := 150 + rand.Intn(500)
 		rf.nextActiveTime = time.Now().Add(time.Duration(randomTerm) * time.Millisecond)
-		println(rf.me, "收到来自leader的有效心跳")
 		if rf.State != 0 {
 			rf.State = 0
 			rf.currentTerm = args.Term
@@ -247,41 +236,6 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArg, reply *AppendEntrie
 		success = false
 	} else {
 		rf.currentTerm = args.Term
-	}
-
-	lenLog := len(rf.Log)
-
-	if lenLog-1 < args.PrevLogIndex || (args.PrevLogIndex > 0 && rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm) {
-		success = false
-		if !(lenLog-1 < args.PrevLogIndex) {
-			rf.Log = rf.Log[:args.PrevLogIndex]
-			println(rf.me, "按指令截断了日志，结尾为", args.PrevLogIndex-1)
-		}
-	}
-
-	if len(args.Entries) == 0 || args.Entries == nil {
-		reply.Success = success
-		return
-	}
-
-	if success {
-		for index := range args.Entries {
-			if index == lenLog {
-				rf.Log = append(rf.Log, args.Entries[index:]...)
-				break
-			}
-		}
-		rf.commitIndex = len(rf.Log) - 1
-		rf.lastApplied = rf.commitIndex
-		println("成功向", rf.me, "append了", len(args.Entries), "条日志，目前总长度为", len(rf.Log))
-		if args.LeaderCommit > rf.commitIndex {
-			min := args.LeaderCommit
-			if len(rf.Log) < min {
-				min = len(rf.Log)
-			}
-			rf.commitIndex = min
-		}
-
 	}
 
 	reply.Success = success
@@ -315,36 +269,16 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArg, reply *AppendEntrie
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArg, reply *AppendEntriesReply) {
-	rf.peers[server].Call("Raft.AppendEntriesHandler", args, reply)
-}
 
-func (rf *Raft) tryAppendEntries(server int, args *AppendEntriesArg) {
-	ok := false
-	for ok == false && !rf.killed() {
-		reply := AppendEntriesReply{}
-		rf.sendAppendEntries(server, args, &reply)
-		if reply.Success {
-			ok = true
-			rf.mu.Lock()
-			rf.nextIndex[server] = len(rf.Log)
-			rf.matchIndex[server] = rf.nextIndex[server] - 1
-			rf.commitIndex = rf.nextIndex[server] - 1
-			rf.mu.Unlock()
-		} else {
-			rf.mu.Lock()
-			rf.nextIndex[server]--
-			args.PrevLogIndex = rf.nextIndex[server] - 1
-			args.PrevLogTerm = rf.Log[args.PrevLogIndex].Term
-			args.Entries = rf.Log[args.PrevLogIndex:]
-			rf.mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
+	rf.peers[server].Call("Raft.AppendEntriesHandler", args, reply)
+
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -365,19 +299,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	index = len(rf.Log)
-	isLeader = rf.State == 2
-	term = rf.currentTerm
-
-	if isLeader {
-		rf.Log = append(rf.Log, LogEntry{index, rf.currentTerm, command})
-		println(rf.me, "收到命令，目前log长度为", len(rf.Log))
-
-		// 立即发起appendEntry
-	}
 
 	return index, term, isLeader
 }
@@ -407,14 +328,12 @@ func (rf *Raft) executeElection(server int, term int, arg RequestVoteArgs) {
 	rf.sendRequestVote(server, &arg, &reply)
 
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	//println(rf.me, "在term", rf.currentTerm, "收到了", server, "的投票回信：", reply.VoteGranted)
 
 	if rf.currentTerm < reply.Term {
 		rf.State = 0
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
-		//println(rf.me, "在candidate时收到来自更高term的消息，转follower")
+		println(rf.me, "在candidate发送投票请求时，在收到来自更高term的消息，转follower")
 	}
 
 	if reply.VoteGranted && rf.State == 1 {
@@ -422,21 +341,10 @@ func (rf *Raft) executeElection(server int, term int, arg RequestVoteArgs) {
 		if rf.votesGot > len(rf.peers)/2 {
 			println(rf.me, "成为了leader!")
 			rf.State = 2
-			lenPeers := len(rf.peers)
-			lenLogs := len(rf.Log)
-			if rf.nextIndex == nil {
-				rf.nextIndex = make([]int, lenPeers)
-			}
-			if rf.matchIndex == nil {
-				rf.matchIndex = make([]int, lenPeers)
-			}
-			for i := 0; i < lenPeers; i++ {
-				rf.nextIndex[i] = lenLogs
-				rf.matchIndex[i] = lenLogs - 1
-			}
 			go rf.doHeartBeat()
 		}
 	}
+	rf.mu.Unlock()
 
 }
 
@@ -484,46 +392,29 @@ func (rf *Raft) ticker() {
 				rf.launchElection()
 			}
 		}
-
-		if rf.commitIndex > rf.lastApplied {
-			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-				applyMsg := ApplyMsg{true, rf.Log[i], rf.Log[i].Index, false, nil, 0, 0}
-				rf.applyChan <- applyMsg
-			}
-		}
-
 		rf.mu.Unlock()
-		time.Sleep(time.Millisecond * 10)
+		time.Sleep(time.Millisecond * 5)
 	}
 }
 
 func (rf *Raft) executeHeartBeat2(arg AppendEntriesArg, server int) {
-	if server == rf.me {
-		return
-	}
-
 	reply := AppendEntriesReply{}
 	rf.sendAppendEntries(server, &arg, &reply)
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
-		rf.currentTerm = reply.Term
 		rf.State = 0
+		rf.currentTerm = reply.Term
+		rf.votedFor = -1
 	}
-	rf.mu.Unlock()
 }
 
-func (rf *Raft) executeHeartBeat(arg AppendEntriesArg, nextInt []int) {
+func (rf *Raft) executeHeartBeat(arg AppendEntriesArg) {
 	maxTerm := 0
 	allReplySuccess := true
-	//println("leader", rf.me, "正在发心跳")
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			reply := AppendEntriesReply{}
-			if arg.PrevLogIndex == -2 {
-				//修改前面的prevLog相关
-				arg.PrevLogIndex = nextInt[i] - 1
-				arg.PrevLogTerm = rf.Log[arg.PrevLogIndex].Term
-			}
 			rf.sendAppendEntries(i, &arg, &reply)
 			if reply.Term > maxTerm {
 				maxTerm = reply.Term
@@ -553,21 +444,22 @@ func (rf *Raft) doHeartBeat() {
 		var arg AppendEntriesArg
 		if len(rf.Log) == 0 {
 			arg = AppendEntriesArg{
-				rf.currentTerm, rf.me, -1,
+				rf.currentTerm, rf.me, 0,
 				0, nil, rf.commitIndex}
 		} else {
 			arg = AppendEntriesArg{
-				rf.currentTerm, rf.me, -2,
-				0, nil, rf.commitIndex}
-			// 这里的prevLog相关需要后面去改
+				rf.currentTerm, rf.me, rf.lastApplied,
+				rf.Log[rf.lastApplied].Term, nil, rf.commitIndex}
 		}
+		lenPeers := len(rf.peers)
 		rf.mu.Unlock()
-
-		for i := 0; i < len(rf.peers); i++ {
-			go rf.executeHeartBeat2(arg, i)
+		//go rf.executeHeartBeat(arg)
+		for i := 0; i < lenPeers; i++ {
+			if i != rf.me {
+				go rf.executeHeartBeat2(arg, i)
+			}
 		}
-
-		time.Sleep(time.Millisecond * 150)
+		time.Sleep(time.Millisecond * 100)
 		rf.mu.Lock()
 	}
 	rf.mu.Unlock()
@@ -593,8 +485,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	randomTerm := 150 + rand.Intn(500)
 	rf.nextActiveTime = time.Now().Add(time.Duration(randomTerm) * time.Millisecond)
-	rf.lastApplied = -1
-	rf.commitIndex = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
