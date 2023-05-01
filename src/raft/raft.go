@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -51,6 +52,7 @@ type ApplyMsg struct {
 type LogEntry struct {
 	Command interface{}
 	Term    int
+	Index   int
 }
 
 // A Go object implementing a single Raft peer.
@@ -75,6 +77,7 @@ type Raft struct {
 	lastApplied    int
 	state          int // follower: 0; candidate: 1; leader: 2
 	nextExpireTime time.Time
+	applyCh        chan ApplyMsg
 
 	//<----- leader使用 ---->
 	nextIndex  []int
@@ -177,6 +180,13 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
+	//  lab页面上的快速回退做法
+	//  XTerm:  term in the conflicting entry (if any)
+	//  XIndex: index of first entry with that term (if any)
+	//  XLen:   log length
 }
 
 // <--------- Handler --------->
@@ -189,14 +199,29 @@ func (rf *Raft) RequestVoteHandler(args *RequestVoteArgs, reply *RequestVoteRepl
 	if args.Term > rf.CurrentTerm {
 		rf.setFollower()
 		rf.CurrentTerm = args.Term
+		rf.nextExpireTime = generateNextExpireTime()
 	}
 
 	reply.Term = rf.CurrentTerm
+	reply.VoteGranted = false
 
-	if rf.VotedFor == -1 && rf.state == 0 {
+	up2date := false
+	if args.LastLogTerm != rf.Log[len(rf.Log)-1].Term {
+		if args.LastLogTerm >= rf.Log[len(rf.Log)-1].Term {
+			up2date = true
+		}
+	} else {
+		if args.LastLogIndex >= len(rf.Log)-1 {
+			up2date = true
+		}
+	}
+
+	if (rf.VotedFor == -1 || rf.VotedFor == args.CandidateID) && up2date {
 		rf.VotedFor = args.CandidateID
 		reply.VoteGranted = true
-		rf.nextExpireTime = generateNextExpireTime()
+	}
+	if !up2date {
+		log.Println(rf.me, "因为log不够新拒绝了投票:", args.LastLogTerm, " ", rf.Log[len(rf.Log)-1].Term)
 	}
 }
 
@@ -204,18 +229,70 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term >= rf.CurrentTerm {
+
+	reply.Term = rf.CurrentTerm
+	if args.Term == rf.CurrentTerm {
+		rf.CurrentTerm = args.Term
+		rf.nextExpireTime = generateNextExpireTime()
+	} else if args.Term > rf.CurrentTerm {
 		rf.setFollower()
 		rf.CurrentTerm = args.Term
 		rf.nextExpireTime = generateNextExpireTime()
-
 	} else if args.Term < rf.CurrentTerm {
 		reply.Success = false
 		return
+		// 1. Reply false if term < currentTerm
 	}
 
-	// TODO: append log
 	reply.Success = true
+	// <--- 安全检查 --->
+
+	// 2. Reply false if log does not contain an entry at prevLogIndex
+	//whose term matches prevLogTerm
+	lenLog := len(rf.Log)
+	if lenLog-1 < args.PrevLogIndex {
+		reply.Success = false
+		reply.XTerm = rf.Log[lenLog-1].Term
+		reply.XIndex = lenLog - 1
+		reply.XLen = lenLog
+		return
+	} else {
+		if rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+
+			reply.XTerm = rf.Log[args.PrevLogIndex].Term
+			for i := 0; i <= args.PrevLogIndex; i++ {
+				if rf.Log[i].Term == reply.XTerm {
+					reply.XIndex = i
+					break
+				}
+			}
+			reply.XLen = lenLog
+			reply.Success = false
+			return
+		}
+	}
+
+	// 3. If an existing entry conflicts with a new one (same index
+	//but different terms), delete the existing entry and all that
+	//follow it
+	for i, argEntry := range args.Entries {
+		if argEntry.Index < len(rf.Log) && argEntry.Term != rf.Log[argEntry.Index].Term {
+			rf.Log = rf.Log[:argEntry.Index]
+			log.Println("server", rf.me, "的log冲突，截取到", argEntry.Index-1)
+		}
+		if argEntry.Index >= len(rf.Log) {
+			// 4. Append any new entries not already in the log
+			rf.Log = append(rf.Log, args.Entries[i:]...)
+			break
+		}
+	}
+
+	// 4. If leaderCommit > commitIndex, set commitIndex =
+	//min(leaderCommit, index of last new entry)
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, rf.Log[len(rf.Log)-1].Index)
+	}
+
 }
 
 // <--------- Request Vote --------->
@@ -227,26 +304,36 @@ func (rf *Raft) sendRequestVote(server *labrpc.ClientEnd, args *RequestVoteArgs)
 		return
 	}
 	rf.mu.Lock()
-	if rf.CurrentTerm == args.Term && rf.state == 1 {
+	defer rf.mu.Unlock()
+
+	if rf.CurrentTerm < reply.Term {
+		rf.setFollower()
+		rf.nextExpireTime = generateNextExpireTime()
+		rf.CurrentTerm = reply.Term
+		return
+	}
+
+	if rf.CurrentTerm == args.Term && rf.state == 1 && reply.VoteGranted {
 		rf.votesGot++
 		if rf.votesGot > len(rf.peers)/2 && rf.state == 1 {
 			rf.becomeLeader()
 			rf.votesGot = 0
 		}
 	}
-	rf.mu.Unlock()
+
 }
 
 func (rf *Raft) becomeLeader() {
 	rf.state = 2
 	rf.nextIndex = make([]int, len(rf.peers))
+	log.Println(rf.me, "成为了Leader！")
 	lenLog := len(rf.Log)
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = lenLog
 	}
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := range rf.matchIndex {
-		rf.nextIndex[i] = 0
+		rf.matchIndex[i] = 0
 	}
 	go rf.doHeartBeat()
 }
@@ -255,7 +342,7 @@ func (rf *Raft) startElection() {
 	rf.state = 1
 	rf.CurrentTerm++
 	rf.VotedFor = rf.me
-	rf.votesGot++
+	rf.votesGot = 1
 	rf.nextExpireTime = generateNextExpireTime()
 	go rf.syncSendRequestVote(rf.CurrentTerm)
 }
@@ -272,7 +359,8 @@ func (rf *Raft) syncSendRequestVote(termBeforeUnlock int) {
 			continue
 		}
 		arg := RequestVoteArgs{
-			rf.CurrentTerm, rf.me, 0, 0,
+			rf.CurrentTerm, rf.me,
+			rf.Log[len(rf.Log)-1].Index, rf.Log[len(rf.Log)-1].Term,
 		}
 		thePeer := *peer
 		go rf.sendRequestVote(&thePeer, &arg)
@@ -286,6 +374,15 @@ func (rf *Raft) ticker() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
+
+		for rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			rf.applyCh <- ApplyMsg{
+				true, rf.Log[rf.lastApplied].Command, rf.Log[rf.lastApplied].Index,
+				false, nil, 0, 0,
+			}
+		}
+
 		nowTime := time.Now()
 		if nowTime.After(rf.nextExpireTime) && rf.state != 2 {
 			rf.startElection()
@@ -305,15 +402,22 @@ func (rf *Raft) doHeartBeat() {
 			return
 		}
 
+		lenLog := len(rf.Log)
+
 		for i, peer := range rf.peers {
 			if i == rf.me {
 				continue
 			}
+			var log2send []LogEntry
+			if lenLog >= rf.nextIndex[i] {
+				log2send = rf.Log[rf.nextIndex[i]:]
+			}
 			arg := AppendEntriesArgs{
-				rf.CurrentTerm, rf.me, 0, 0, nil, 0,
+				rf.CurrentTerm, rf.me, rf.nextIndex[i] - 1,
+				rf.Log[rf.nextIndex[i]-1].Term, log2send, rf.commitIndex,
 			}
 			thePeer := *peer
-			go rf.sendAppendEntries(&thePeer, &arg)
+			go rf.sendAppendEntries(&thePeer, &arg, i)
 		}
 
 		rf.mu.Unlock()
@@ -322,7 +426,7 @@ func (rf *Raft) doHeartBeat() {
 
 }
 
-func (rf *Raft) sendAppendEntries(server *labrpc.ClientEnd, args *AppendEntriesArgs) {
+func (rf *Raft) sendAppendEntries(server *labrpc.ClientEnd, args *AppendEntriesArgs, serverID int) {
 	reply := AppendEntriesReply{}
 	ok := server.Call("Raft.AppendEntriesHandler", args, &reply)
 	if !ok {
@@ -341,9 +445,49 @@ func (rf *Raft) sendAppendEntries(server *labrpc.ClientEnd, args *AppendEntriesA
 	}
 
 	if reply.Success {
-		//TODO: 5.3
+		rf.matchIndex[serverID] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[serverID] = rf.matchIndex[serverID] + 1
+
+		// 大多数match后即可提交
+		for i := len(rf.Log) - 1; i >= rf.matchIndex[serverID] && i > rf.commitIndex; i-- {
+			count := 0
+			for j := range rf.peers {
+				if rf.matchIndex[j] >= i {
+					count++
+				}
+				if count > (len(rf.peers) / 2) {
+					rf.commitIndex = i
+					break
+				}
+			}
+		}
 	} else {
-		//TODO: 5.3
+		// 根据实验页面指引做的优化
+		//  Case 1: leader doesn't have XTerm:
+		//    nextIndex = XIndex
+		//  Case 2: leader has XTerm:
+		//    nextIndex = leader's last entry for XTerm
+		//  Case 3: follower's log is too short:
+		//    nextIndex = XLen
+		// 正确性：log的term一定是递增且连续的; term高的才可能成为leader;
+		// peer缺少XTerm的log：回退到XTerm的初始位置(XIndex)以补完;
+		// peer在XTerm的log比leader多：回退到leader在XTerm的log的末尾位置以覆盖多余log.
+		if (reply.XLen - 1) < args.PrevLogIndex {
+			rf.nextIndex[serverID] = reply.XLen
+		} else {
+			lastXTerm := -1
+			for i := len(rf.Log) - 1; i >= 0; i-- {
+				if rf.Log[i].Term == reply.XTerm {
+					lastXTerm = i
+					break
+				}
+			}
+			if lastXTerm == -1 {
+				rf.nextIndex[serverID] = reply.XIndex
+			} else {
+				rf.nextIndex[serverID] = lastXTerm
+			}
+		}
 	}
 	rf.mu.Unlock()
 }
@@ -366,6 +510,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	index = len(rf.Log)
+	term = rf.CurrentTerm
+	isLeader = rf.state == 2
+	if isLeader {
+		newLog := LogEntry{command, term, index}
+		rf.Log = append(rf.Log, newLog)
+		rf.matchIndex[rf.me] = index
+	}
 
 	return index, term, isLeader
 }
@@ -409,11 +564,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.CurrentTerm = 0
 	rf.VotedFor = -1
 	rf.Log = []LogEntry{}
+	rf.Log = append(rf.Log, LogEntry{nil, -1, 0})
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.votesGot = 0
 	rf.state = 0
 	rf.nextExpireTime = generateNextExpireTime()
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -435,4 +592,12 @@ func (rf *Raft) setFollower() {
 func generateNextExpireTime() time.Time {
 	millisecond := 150 + rand.Intn(150)
 	return time.Now().Add(time.Duration(millisecond) * time.Millisecond)
+}
+
+func min(a, b int) int {
+	if a > b {
+		return b
+	} else {
+		return a
+	}
 }
