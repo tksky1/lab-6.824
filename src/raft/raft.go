@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	"log"
 	"math/rand"
 	"sync"
@@ -112,13 +114,13 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.VotedFor)
+	e.Encode(rf.Log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -127,18 +129,18 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var CurrentTerm int
+	var VotedFor int
+	var Log []LogEntry
+	if d.Decode(&CurrentTerm) != nil || d.Decode(&VotedFor) != nil || d.Decode(&Log) != nil {
+		log.Println("读持久化错误！")
+	} else {
+		rf.CurrentTerm = CurrentTerm
+		rf.VotedFor = VotedFor
+		rf.Log = Log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -196,10 +198,12 @@ func (rf *Raft) RequestVoteHandler(args *RequestVoteArgs, reply *RequestVoteRepl
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	rf.readPersist(rf.persister.ReadRaftState())
+
 	if args.Term > rf.CurrentTerm {
 		rf.setFollower()
 		rf.CurrentTerm = args.Term
-		rf.nextExpireTime = generateNextExpireTime()
+		rf.persist()
 	}
 
 	reply.Term = rf.CurrentTerm
@@ -218,10 +222,9 @@ func (rf *Raft) RequestVoteHandler(args *RequestVoteArgs, reply *RequestVoteRepl
 
 	if (rf.VotedFor == -1 || rf.VotedFor == args.CandidateID) && up2date {
 		rf.VotedFor = args.CandidateID
+		rf.persist()
 		reply.VoteGranted = true
-	}
-	if !up2date {
-		log.Println(rf.me, "因为log不够新拒绝了投票:", args.LastLogTerm, " ", rf.Log[len(rf.Log)-1].Term)
+		rf.nextExpireTime = generateNextExpireTime()
 	}
 }
 
@@ -230,13 +233,17 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	rf.readPersist(rf.persister.ReadRaftState())
+
 	reply.Term = rf.CurrentTerm
 	if args.Term == rf.CurrentTerm {
 		rf.CurrentTerm = args.Term
+		rf.persist()
 		rf.nextExpireTime = generateNextExpireTime()
 	} else if args.Term > rf.CurrentTerm {
 		rf.setFollower()
 		rf.CurrentTerm = args.Term
+		rf.persist()
 		rf.nextExpireTime = generateNextExpireTime()
 	} else if args.Term < rf.CurrentTerm {
 		reply.Success = false
@@ -278,11 +285,13 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 	for i, argEntry := range args.Entries {
 		if argEntry.Index < len(rf.Log) && argEntry.Term != rf.Log[argEntry.Index].Term {
 			rf.Log = rf.Log[:argEntry.Index]
-			log.Println("server", rf.me, "的log冲突，截取到", argEntry.Index-1)
+			rf.persist()
+			//log.Println("server", rf.me, "的log冲突，截取到", argEntry.Index-1)
 		}
 		if argEntry.Index >= len(rf.Log) {
 			// 4. Append any new entries not already in the log
 			rf.Log = append(rf.Log, args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 	}
@@ -308,8 +317,8 @@ func (rf *Raft) sendRequestVote(server *labrpc.ClientEnd, args *RequestVoteArgs)
 
 	if rf.CurrentTerm < reply.Term {
 		rf.setFollower()
-		rf.nextExpireTime = generateNextExpireTime()
 		rf.CurrentTerm = reply.Term
+		rf.persist()
 		return
 	}
 
@@ -326,7 +335,7 @@ func (rf *Raft) sendRequestVote(server *labrpc.ClientEnd, args *RequestVoteArgs)
 func (rf *Raft) becomeLeader() {
 	rf.state = 2
 	rf.nextIndex = make([]int, len(rf.peers))
-	log.Println(rf.me, "成为了Leader！")
+	//log.Println(rf.me, "成为了Leader！")
 	lenLog := len(rf.Log)
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = lenLog
@@ -342,6 +351,7 @@ func (rf *Raft) startElection() {
 	rf.state = 1
 	rf.CurrentTerm++
 	rf.VotedFor = rf.me
+	rf.persist()
 	rf.votesGot = 1
 	rf.nextExpireTime = generateNextExpireTime()
 	go rf.syncSendRequestVote(rf.CurrentTerm)
@@ -388,39 +398,43 @@ func (rf *Raft) ticker() {
 			rf.startElection()
 		}
 		rf.mu.Unlock()
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
 // <--------- AppendEntries --------->
 
+func (rf *Raft) innerHeartBeat() {
+	rf.mu.Lock()
+	if rf.state != 2 || rf.killed() {
+		rf.mu.Unlock()
+		return
+	}
+
+	lenLog := len(rf.Log)
+
+	for i, peer := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		var log2send []LogEntry
+		if lenLog >= rf.nextIndex[i] {
+			log2send = rf.Log[rf.nextIndex[i]:]
+		}
+		arg := AppendEntriesArgs{
+			rf.CurrentTerm, rf.me, rf.nextIndex[i] - 1,
+			rf.Log[rf.nextIndex[i]-1].Term, log2send, rf.commitIndex,
+		}
+		thePeer := *peer
+		go rf.sendAppendEntries(&thePeer, &arg, i)
+	}
+
+	rf.mu.Unlock()
+}
+
 func (rf *Raft) doHeartBeat() {
 	for {
-		rf.mu.Lock()
-		if rf.state != 2 || rf.killed() {
-			rf.mu.Unlock()
-			return
-		}
-
-		lenLog := len(rf.Log)
-
-		for i, peer := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			var log2send []LogEntry
-			if lenLog >= rf.nextIndex[i] {
-				log2send = rf.Log[rf.nextIndex[i]:]
-			}
-			arg := AppendEntriesArgs{
-				rf.CurrentTerm, rf.me, rf.nextIndex[i] - 1,
-				rf.Log[rf.nextIndex[i]-1].Term, log2send, rf.commitIndex,
-			}
-			thePeer := *peer
-			go rf.sendAppendEntries(&thePeer, &arg, i)
-		}
-
-		rf.mu.Unlock()
+		rf.innerHeartBeat()
 		time.Sleep(100 * time.Millisecond)
 	}
 
@@ -433,14 +447,15 @@ func (rf *Raft) sendAppendEntries(server *labrpc.ClientEnd, args *AppendEntriesA
 		return
 	}
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.CurrentTerm != args.Term || rf.state != 2 {
-		rf.mu.Unlock()
+
 		return
 	}
 	if rf.CurrentTerm < reply.Term {
 		rf.setFollower()
 		rf.CurrentTerm = reply.Term
-		rf.mu.Unlock()
+		rf.persist()
 		return
 	}
 
@@ -455,7 +470,7 @@ func (rf *Raft) sendAppendEntries(server *labrpc.ClientEnd, args *AppendEntriesA
 				if rf.matchIndex[j] >= i {
 					count++
 				}
-				if count > (len(rf.peers) / 2) {
+				if count > (len(rf.peers)/2) && rf.Log[i].Term == rf.CurrentTerm {
 					rf.commitIndex = i
 					break
 				}
@@ -489,7 +504,6 @@ func (rf *Raft) sendAppendEntries(server *labrpc.ClientEnd, args *AppendEntriesA
 			}
 		}
 	}
-	rf.mu.Unlock()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -511,7 +525,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+
+	rf.readPersist(rf.persister.ReadRaftState())
 
 	index = len(rf.Log)
 	term = rf.CurrentTerm
@@ -519,7 +534,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		newLog := LogEntry{command, term, index}
 		rf.Log = append(rf.Log, newLog)
+		rf.persist()
 		rf.matchIndex[rf.me] = index
+		rf.mu.Unlock()
+		rf.innerHeartBeat()
+	} else {
+		rf.mu.Unlock()
 	}
 
 	return index, term, isLeader
@@ -587,6 +607,7 @@ func (rf *Raft) setFollower() {
 	rf.state = 0
 	rf.votesGot = 0
 	rf.VotedFor = -1
+	rf.persist()
 }
 
 func generateNextExpireTime() time.Time {
