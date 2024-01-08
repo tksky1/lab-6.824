@@ -182,20 +182,23 @@ func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 // returns "" or error string
 func (cfg *config) ingestSnap(i int, snapshot []byte, index int) string {
 	if snapshot == nil {
-		log.Fatalf("nil snapshot")
-		return "nil snapshot"
+		log.Fatalf("nil Snapshot")
+		return "nil Snapshot"
 	}
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	var lastIncludedIndex int
 	var xlog []interface{}
-	if d.Decode(&lastIncludedIndex) != nil ||
-		d.Decode(&xlog) != nil {
-		log.Fatalf("snapshot decode error")
-		return "snapshot Decode() error"
+	var err1 error
+	var err2 error
+	err1 = d.Decode(&lastIncludedIndex)
+	err2 = d.Decode(&xlog)
+	if err1 != nil || err2 != nil {
+		log.Fatalf("Snapshot decode error %v, %v", err1, err2)
+		return "Snapshot Decode() error"
 	}
 	if index != -1 && index != lastIncludedIndex {
-		err := fmt.Sprintf("server %v snapshot doesn't match m.SnapshotIndex", i)
+		err := fmt.Sprintf("server %v Snapshot doesn't match m.SnapshotIndex", i)
 		return err
 	}
 	cfg.logs[i] = map[int]interface{}{}
@@ -208,7 +211,7 @@ func (cfg *config) ingestSnap(i int, snapshot []byte, index int) string {
 
 const SnapShotInterval = 10
 
-// periodically snapshot raft state
+// periodically Snapshot raft state
 func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 	cfg.mu.Lock()
 	rf := cfg.rafts[i]
@@ -300,7 +303,7 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 
 		snapshot := cfg.saved[i].ReadSnapshot()
 		if snapshot != nil && len(snapshot) > 0 {
-			// mimic KV server and process snapshot now.
+			// mimic KV server and process Snapshot now.
 			// ideally Raft should send it up on applyCh...
 			err := cfg.ingestSnap(i, snapshot, -1)
 			if err != "" {

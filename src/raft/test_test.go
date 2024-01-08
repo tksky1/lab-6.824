@@ -1125,7 +1125,7 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			cfg.one(rand.Int(), servers-1, true)
 		}
 
-		// perhaps send enough to get a snapshot
+		// perhaps send enough to get a Snapshot
 		nn := (SnapShotInterval / 2) + (rand.Int() % SnapShotInterval)
 		for i := 0; i < nn; i++ {
 			cfg.rafts[sender].Start(rand.Int())
@@ -1146,7 +1146,7 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 		}
 		if disconnect {
 			// reconnect a follower, who maybe behind and
-			// needs to rceive a snapshot to catch up.
+			// needs to rceive a Snapshot to catch up.
 			cfg.connect(victim)
 			cfg.one(rand.Int(), servers, true)
 			leader1 = cfg.checkOneLeader()
@@ -1183,7 +1183,7 @@ func TestSnapshotInstallUnCrash2D(t *testing.T) {
 }
 
 // do the servers persist the snapshots, and
-// restart using snapshot along with the
+// restart using Snapshot along with the
 // tail of the log?
 func TestSnapshotAllCrash2D(t *testing.T) {
 	servers := 3
@@ -1196,7 +1196,7 @@ func TestSnapshotAllCrash2D(t *testing.T) {
 	cfg.one(rand.Int(), servers, true)
 
 	for i := 0; i < iters; i++ {
-		// perhaps enough to get a snapshot
+		// perhaps enough to get a Snapshot
 		nn := (SnapShotInterval / 2) + (rand.Int() % SnapShotInterval)
 		for i := 0; i < nn; i++ {
 			cfg.one(rand.Int(), servers, true)
@@ -1223,17 +1223,17 @@ func TestSnapshotAllCrash2D(t *testing.T) {
 	cfg.end()
 }
 
-// do servers correctly initialize their in-memory copy of the snapshot, making
+// do servers correctly initialize their in-memory copy of the Snapshot, making
 // sure that future writes to persistent state don't lose state?
 func TestSnapshotInit2D(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, true)
 	defer cfg.cleanup()
 
-	cfg.begin("Test (2D): snapshot initialization after crash")
+	cfg.begin("Test (2D): Snapshot initialization after crash")
 	cfg.one(rand.Int(), servers, true)
 
-	// enough ops to make a snapshot
+	// enough ops to make a Snapshot
 	nn := SnapShotInterval + 1
 	for i := 0; i < nn; i++ {
 		cfg.one(rand.Int(), servers, true)
