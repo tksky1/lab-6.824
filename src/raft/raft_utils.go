@@ -8,24 +8,6 @@ import (
 	"time"
 )
 
-// 修改snapshot相关信息，置server快照到index为止并截log
-func (rf *Raft) setSnapshot(index int, snapshot []byte) {
-	rf.BaseTerm = rf.Log[index-rf.BaseIndex].Term
-	offset := index - rf.BaseIndex
-	rf.BaseIndex = index
-	rf.SnapshotData = snapshot
-	if offset > 0 {
-		rf.Log = rf.Log[offset+1:]
-		var newLog []LogEntry
-		newLog = append(newLog, LogEntry{nil, rf.BaseTerm, rf.BaseIndex})
-		rf.Log = append(newLog, rf.Log...)
-	} else {
-		rf.Log = []LogEntry{}
-		rf.Log = append(rf.Log, LogEntry{nil, rf.BaseTerm, rf.BaseIndex})
-	}
-	rf.persist()
-}
-
 func (rf *Raft) setFollower() {
 	rf.state = 0
 	rf.votesGot = 0
@@ -49,19 +31,9 @@ func (rf *Raft) persist() {
 	e.Encode(rf.Log)
 	e.Encode(rf.BaseIndex)
 	e.Encode(rf.BaseTerm)
-	raftstate := w.Bytes()
+	raftState := w.Bytes()
 
-	var raftSnapshot []byte
-	if rf.SnapshotData == nil {
-		raftSnapshot = nil
-	} else {
-		w2 := new(bytes.Buffer)
-		e2 := labgob.NewEncoder(w2)
-		e2.Encode(rf.SnapshotData)
-		raftSnapshot = w2.Bytes()
-	}
-
-	rf.persister.Save(raftstate, raftSnapshot)
+	rf.persister.Save(raftState, rf.SnapshotData)
 }
 
 // restore previously persisted state.
@@ -88,6 +60,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.BaseIndex = BaseIndex
 		rf.BaseTerm = BaseTerm
 	}
+
+	rf.SnapshotData = rf.persister.ReadSnapshot()
 }
 
 func generateNextExpireTime() time.Time {

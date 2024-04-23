@@ -59,6 +59,7 @@ type Raft struct {
 	state          int // follower: 0; candidate: 1; leader: 2
 	nextExpireTime time.Time
 	applyCh        chan ApplyMsg
+	syncApplyCh    chan ApplyMsg // commit to applier to sync-apply msg
 
 	//<----- leader使用 ---->
 	nextIndex  []int

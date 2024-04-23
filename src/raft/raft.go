@@ -18,9 +18,6 @@ package raft
 //
 
 import (
-	"6.5840/labgob"
-	"bytes"
-	"log"
 	"sync/atomic"
 	"time"
 
@@ -43,22 +40,6 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-// 恢复持久化的快照
-func (rf *Raft) readPersistSnapshot() {
-	data := rf.persister.ReadSnapshot()
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
-	r := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(r)
-	var SnapshotData []byte
-	if d.Decode(&SnapshotData) != nil {
-		log.Println("读持久化错误！")
-	} else {
-		rf.SnapshotData = SnapshotData
-	}
-}
-
 // the service says it has created a Snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -68,9 +49,24 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.setSnapshot(index, snapshot)
-	println(rf.me, "snapshot saved, now lenLog:", len(rf.Log))
-	println("now baseIndex:", rf.BaseIndex)
+	/*if rf.BaseIndex >= index {
+		return
+	}*/
+
+	rf.SnapshotData = snapshot
+	rf.BaseIndex = index
+	for i := 1; i <= len(rf.Log)-1; i++ {
+		if rf.Log[i].Index == index {
+			rf.BaseTerm = rf.Log[i].Term
+			var newLog []LogEntry
+			newLog = append(newLog, LogEntry{nil, rf.BaseTerm, rf.BaseIndex})
+			newLog = append(newLog, rf.Log[i+1:]...)
+			rf.Log = newLog
+			break
+		}
+	}
+	rf.persist()
+	println(rf.me, "snapshot saved, now lenLog:", len(rf.Log), "now baseIndex:", rf.BaseIndex)
 
 }
 
@@ -150,13 +146,13 @@ func (rf *Raft) syncSendRequestVote(termBeforeUnlock int) {
 
 // follower判断是否该造反
 func (rf *Raft) ticker() {
-	var msg []ApplyMsg
-	var channel chan ApplyMsg
+	/*	var msg []ApplyMsg
+		var channel chan ApplyMsg*/
 	for rf.killed() == false {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
-		channel = rf.applyCh
+		/*channel = rf.applyCh*/
 
 		if rf.lastApplied < rf.BaseIndex {
 			rf.lastApplied = rf.BaseIndex
@@ -164,11 +160,16 @@ func (rf *Raft) ticker() {
 
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
-			msg = append(msg, ApplyMsg{
+			/*msg = append(msg, ApplyMsg{
 				true, rf.Log[rf.lastApplied-rf.BaseIndex].Command,
 				rf.Log[rf.lastApplied-rf.BaseIndex].Index,
 				false, nil, 0, 0,
-			})
+			})*/
+			rf.syncApplyCh <- ApplyMsg{
+				true, rf.Log[rf.lastApplied-rf.BaseIndex].Command,
+				rf.Log[rf.lastApplied-rf.BaseIndex].Index,
+				false, nil, 0, 0,
+			}
 		}
 
 		nowTime := time.Now()
@@ -176,13 +177,13 @@ func (rf *Raft) ticker() {
 			rf.startElection()
 		}
 		rf.mu.Unlock()
-		// chan发送独立出来，防止持有锁的情况下channel阻塞导致死锁（上层调snapshot()以后会阻塞，而snapshot需要锁）
+		/*// chan发送独立出来，防止持有锁的情况下channel阻塞导致死锁（上层调snapshot()以后会阻塞，而snapshot需要锁）
 		if msg != nil {
 			for _, message := range msg {
 				channel <- message
 			}
 			msg = nil
-		}
+		}*/
 		time.Sleep(20 * time.Millisecond)
 	}
 }
@@ -202,24 +203,28 @@ func (rf *Raft) innerHeartBeat() {
 		if i == rf.me {
 			continue
 		}
+
+		if rf.nextIndex[i] <= rf.BaseIndex {
+			// 如果所需信息已经被截掉
+			snapshotData := make([]byte, len(rf.SnapshotData))
+			copy(snapshotData, rf.SnapshotData)
+			args := InstallSnapshotArgs{
+				Term:              rf.CurrentTerm,
+				LeaderID:          rf.me,
+				LastIncludedIndex: rf.BaseIndex,
+				LastIncludedTerm:  rf.BaseTerm,
+				Data:              snapshotData,
+			}
+			go rf.sendInstallSnapshot(rf.peers[i], &args, i)
+			continue
+		}
+
 		var log2send []LogEntry
 		if lenLog >= rf.nextIndex[i]-rf.BaseIndex {
-			if rf.nextIndex[i] <= rf.BaseIndex {
-				// 如果所需信息已经被截掉
-				args := InstallSnapshotArgs{
-					Term:              rf.CurrentTerm,
-					LeaderID:          rf.me,
-					LastIncludedIndex: rf.BaseIndex,
-					LastIncludedTerm:  rf.BaseTerm,
-					Data:              rf.SnapshotData,
-				}
-				go rf.sendInstallSnapshot(rf.peers[i], &args, i)
-				continue
-			}
 			log2send = rf.Log[(rf.nextIndex[i] - rf.BaseIndex):]
 		}
 		arg := AppendEntriesArgs{}
-		if rf.nextIndex[i]-1-rf.BaseIndex == 0 {
+		if rf.nextIndex[i]-1-rf.BaseIndex <= 0 {
 			// prevLogIndex 已经不在log中了，要从baseIndex读
 			if rf.BaseIndex == 0 {
 				// 之前没有snapshot
@@ -278,7 +283,7 @@ func (rf *Raft) sendAppendEntries(server *labrpc.ClientEnd, args *AppendEntriesA
 		rf.matchIndex[serverID] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[serverID] = rf.matchIndex[serverID] + 1
 		// 大多数match后即可提交
-		for i := len(rf.Log) - 1 + rf.BaseIndex; i >= rf.matchIndex[serverID] && i > rf.commitIndex; i-- {
+		for i := rf.Log[len(rf.Log)-1].Index; i >= rf.matchIndex[serverID] && i > rf.commitIndex; i-- {
 			count := 0
 			for j := range rf.peers {
 				if rf.matchIndex[j] >= i {
@@ -311,7 +316,7 @@ func (rf *Raft) sendAppendEntries(server *labrpc.ClientEnd, args *AppendEntriesA
 			lastXTerm := -1
 			for i := len(rf.Log) - 1; i >= 0; i-- {
 				if rf.Log[i].Term == reply.XTerm {
-					lastXTerm = i + rf.BaseIndex
+					lastXTerm = rf.Log[i].Index
 					break
 				}
 			}
@@ -325,7 +330,7 @@ func (rf *Raft) sendAppendEntries(server *labrpc.ClientEnd, args *AppendEntriesA
 }
 
 func (rf *Raft) sendInstallSnapshot(server *labrpc.ClientEnd, args *InstallSnapshotArgs, serverID int) {
-	println("leader", rf.me, "正在发送InstallSnapshot 到", serverID, ",截止index为", args.LastIncludedIndex)
+	println("leader", rf.me, "发Snapshot到", serverID, ",截止到", args.LastIncludedIndex)
 	reply := InstallSnapshotReply{}
 	ok := server.Call("Raft.InstallSnapshotHandler", args, &reply)
 	if !ok {
@@ -346,8 +351,10 @@ func (rf *Raft) sendInstallSnapshot(server *labrpc.ClientEnd, args *InstallSnaps
 
 	if rf.matchIndex[serverID] < args.LastIncludedIndex {
 		rf.matchIndex[serverID] = args.LastIncludedIndex
-		rf.nextIndex[serverID] = rf.matchIndex[serverID] + 1
-		println("置", serverID, "的matchIndex为", args.LastIncludedIndex)
+		println("aaa置", serverID, "的matchIndex为", args.LastIncludedIndex)
+	}
+	if rf.nextIndex[serverID] <= args.LastIncludedIndex {
+		rf.nextIndex[serverID] = args.LastIncludedIndex + 1
 	}
 }
 
@@ -434,17 +441,39 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.votesGot = 0
 	rf.state = 0
+	rf.BaseIndex = 0
+	rf.BaseTerm = -1
 	rf.nextExpireTime = generateNextExpireTime()
 	rf.applyCh = applyCh
+	rf.syncApplyCh = make(chan ApplyMsg, 1000)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	rf.readPersistSnapshot()
+	if len(rf.Log) == 0 {
+		if rf.CurrentTerm == 0 {
+			rf.BaseTerm = -1
+		}
+		rf.Log = append([]LogEntry{}, LogEntry{nil, rf.BaseTerm, rf.BaseIndex})
+	} else {
+		rf.Log[0] = LogEntry{nil, rf.BaseTerm, rf.BaseIndex}
+	}
 	rf.lastApplied = rf.BaseIndex
 	rf.commitIndex = rf.BaseIndex
-
+	go rf.applier()
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
 	return rf
+}
+
+func (rf *Raft) applier() {
+	for rf.killed() == false {
+		msg := <-rf.syncApplyCh
+		if msg.CommandValid {
+			println(rf.me, "applying command up to", msg.CommandIndex)
+		} else {
+			println(rf.me, "applying snapshot up to", msg.SnapshotIndex)
+		}
+		rf.applyCh <- msg
+	}
 }

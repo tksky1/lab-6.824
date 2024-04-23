@@ -16,21 +16,47 @@ func (rf *Raft) InstallSnapshotHandler(args *InstallSnapshotArgs, reply *Install
 		return
 	}
 
-	if args.LastIncludedIndex >= rf.Log[len(rf.Log)-1].Index {
-		// snapshot内容完全大于所有log，直接覆盖
-		rf.Log = nil
-		rf.Log = append(rf.Log, LogEntry{nil, args.LastIncludedTerm, args.LastIncludedIndex})
-		rf.BaseIndex = args.LastIncludedIndex
-		rf.BaseTerm = args.LastIncludedTerm
-		rf.SnapshotData = args.Data
-		rf.persist()
-	} else {
-		rf.setSnapshot(args.LastIncludedIndex, args.Data)
+	rf.nextExpireTime = generateNextExpireTime()
+	for i := 1; i <= len(rf.Log)-1; i++ {
+		if rf.Log[i].Index == args.LastIncludedIndex && rf.Log[i].Term == args.LastIncludedTerm {
+			if i != len(rf.Log)-1 {
+				rf.BaseIndex = args.LastIncludedIndex
+				rf.BaseTerm = args.LastIncludedTerm
+				var newLog []LogEntry
+				newLog = append(newLog, LogEntry{nil, args.LastIncludedTerm, args.LastIncludedIndex})
+				newLog = append(newLog, rf.Log[i+1:]...)
+				rf.Log = newLog
+				rf.SnapshotData = args.Data
+
+				if rf.lastApplied < rf.BaseIndex {
+					rf.lastApplied = rf.BaseIndex
+				}
+				if rf.commitIndex < rf.BaseIndex {
+					rf.commitIndex = rf.BaseIndex
+				}
+
+				rf.persist()
+				rf.mu.Unlock()
+				rf.syncApplyCh <- ApplyMsg{
+					false, nil, 0, true, args.Data,
+					args.LastIncludedTerm, args.LastIncludedIndex,
+				}
+				return
+			}
+		}
 	}
-	println("server", rf.me, "的baseIndex set to:", rf.BaseIndex)
-	channel := rf.applyCh
+
+	// 覆盖
+	rf.Log = nil
+	rf.Log = append(rf.Log, LogEntry{nil, args.LastIncludedTerm, args.LastIncludedIndex})
+	rf.SnapshotData = args.Data
+	rf.BaseTerm = args.LastIncludedTerm
+	rf.BaseIndex = args.LastIncludedIndex
+	rf.lastApplied = rf.BaseIndex
+	rf.commitIndex = rf.BaseIndex
+	rf.persist()
 	rf.mu.Unlock()
-	channel <- ApplyMsg{
+	rf.syncApplyCh <- ApplyMsg{
 		false, nil, 0, true, args.Data,
 		args.LastIncludedTerm, args.LastIncludedIndex,
 	}
@@ -99,27 +125,37 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 
 	// 2. Reply false if log does not contain an entry at prevLogIndex
 	//whose term matches prevLogTerm
+
+	//	XTerm:  term in the conflicting entry (if any)
+	//  XIndex: index of first entry with that term (if any)
+	//  XLen:   log length
 	lenLog := len(rf.Log)
 	if lenLog-1 < args.PrevLogIndex-rf.BaseIndex {
+		// follower log 长度不够，XLen 正确返回就行
 		reply.Success = false
 		reply.XTerm = rf.Log[lenLog-1].Term
 		reply.XIndex = lenLog - 1 + rf.BaseIndex
 		reply.XLen = lenLog + rf.BaseIndex
 		return
 	} else {
-		if args.PrevLogIndex < rf.BaseIndex && rf.BaseIndex != 0 {
+		if args.PrevLogIndex < rf.BaseIndex {
 			println("prevLogIndex<rf.BaseIndex:", args.PrevLogIndex, rf.BaseIndex)
-			reply.Success = false
-			// 告知leader是由于请求过期而非冲突拒收
-			reply.XLen = -1
+			for i, argEntry := range args.Entries {
+				if argEntry.Index-rf.BaseIndex >= len(rf.Log) {
+					// 4. Append any new entries not already in the log
+					rf.Log = append(rf.Log, args.Entries[i:]...)
+					rf.persist()
+					break
+				}
+			}
+			reply.Success = true
 			return
-		}
-		if rf.Log[args.PrevLogIndex-rf.BaseIndex].Term != args.PrevLogTerm {
+		} else if rf.Log[args.PrevLogIndex-rf.BaseIndex].Term != args.PrevLogTerm {
 
 			reply.XTerm = rf.Log[args.PrevLogIndex-rf.BaseIndex].Term
 			for i := 0; i <= args.PrevLogIndex-rf.BaseIndex; i++ {
 				if rf.Log[i].Term == reply.XTerm {
-					reply.XIndex = i + rf.BaseIndex
+					reply.XIndex = rf.Log[i].Index
 					break
 				}
 			}

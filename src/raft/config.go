@@ -194,6 +194,8 @@ func (cfg *config) ingestSnap(i int, snapshot []byte, index int) string {
 	err1 = d.Decode(&lastIncludedIndex)
 	err2 = d.Decode(&xlog)
 	if err1 != nil || err2 != nil {
+		println(i, len(snapshot))
+		panic(err1)
 		log.Fatalf("Snapshot decode error %v, %v", err1, err2)
 		return "Snapshot Decode() error"
 	}
